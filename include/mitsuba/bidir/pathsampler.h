@@ -103,6 +103,15 @@ public:
         Sampler *sensorSampler, Sampler *directSampler, int maxDepth, int rrDepth,
         bool excludeDirectIllum, bool sampleDirect, bool lightImage = true);
 
+    PathSampler(ETechnique technique, const Scene *scene, const Scene *scene_modified,
+        Sampler *emitterSampler,
+        Sampler *sensorSampler, Sampler *directSampler, int maxDepth, int rrDepth,
+        bool excludeDirectIllum, bool sampleDirect, bool lightImage = true);
+
+    /* Bing implemented for MMLT
+    * sample the splats only by specific techniques (s, t, depth)
+    */
+    void sampleSplats_mmlt(const Point2i &offset, SplatList &list, int depth);
     /**
      * \brief Generate a sample using the configured sampling strategy
      *
@@ -143,7 +152,18 @@ public:
      *    specifies the path importance weight.
      */
     void samplePaths(const Point2i &offset, PathCallback &callback);
+    /**
+    Bing implemented for MMLT
+    * Return the seeds cut into batches of the same length
+    **/
+    Float generateSeeds_mmlt(size_t nSampleCount, size_t seedCount,
+            bool fineGrained, const Bitmap *importanceMap,
+            std::vector<PathSeed> &seeds, int maxDepth, std::vector<Float> &luminance_for_depths);
 
+    Float PathSampler::generateSeeds_mmlt_difference(size_t nSampleCount, size_t seedCount,
+            bool fineGrained, const Bitmap *importanceMap,
+            std::vector<PathSeed> &seeds, std::vector<PathSeed> &seeds_modified, int maxDepth, 
+            std::vector<Float> &luminance_for_depths, std::vector<Float> &luminance_for_depths_modified);
     /**
      * \brief Generates a sequence of seeds that are suitable for
      * starting a MLT Markov Chain
@@ -195,6 +215,7 @@ protected:
 protected:
     ETechnique m_technique;
     ref<const Scene> m_scene;
+    ref<const Scene> m_scene_modified;
     ref<SamplingIntegrator> m_integrator;
     ref<Sampler> m_emitterSampler;
     ref<Sampler> m_sensorSampler;
@@ -223,12 +244,12 @@ struct PathSeed {
     Float luminance;    ///< Luminance value of the path (for sanity checks)
     int s;              ///< Number of steps from the luminaire
     int t;              ///< Number of steps from the eye
+    int depth;
 
     inline PathSeed() { }
 
-    inline PathSeed(size_t sampleIndex, Float luminance, int s = 0, int t = 0)
-        : sampleIndex(sampleIndex), luminance(luminance), s(s), t(t) { }
-
+    inline PathSeed(size_t sampleIndex, Float luminance, int depth = 0, int s = 0, int t = 0)
+        : sampleIndex(sampleIndex), luminance(luminance), s(s), t(t),  depth(depth){}
     inline PathSeed(Stream *stream) {
         sampleIndex = stream->readSize();
         luminance = stream->readFloat();

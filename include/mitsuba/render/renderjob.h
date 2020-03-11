@@ -74,6 +74,14 @@ public:
         bool threadIsCritical = true,
         bool interactive = false);
 
+        RenderJob(const std::string &threadName,
+        Scene *scene, Scene *scene_modified, RenderQueue *queue,
+        int sceneResID = -1,
+        int sensorResID = -1,
+        int samplerResID = -1,
+        bool threadIsCritical = true,
+        bool interactive = false);
+
     /// Write out the current (partially rendered) image
     inline void flush() { m_scene->flush(m_queue, this); }
 
@@ -118,8 +126,10 @@ protected:
     void run();
 private:
     ref<Scene> m_scene;
+    ref<Scene> m_scene_modified; //ADDED
     ref<RenderQueue> m_queue;
     int m_sceneResID, m_samplerResID, m_sensorResID;
+    int m_sceneModifiedResID; //ADDED
     bool m_ownsSceneResource;
     bool m_ownsSensorResource;
     bool m_ownsSamplerResource;

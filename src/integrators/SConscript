@@ -32,6 +32,10 @@ plugins += bidirEnv.SharedLibrary('pssmlt',
         ['pssmlt/pssmlt.cpp', 'pssmlt/pssmlt_sampler.cpp',
     'pssmlt/pssmlt_proc.cpp']);
 
+plugins += bidirEnv.SharedLibrary('mmlt',
+        ['mmlt/mmlt.cpp', 'mmlt/mmlt_sampler.cpp',
+    'mmlt/mmlt_proc.cpp']);
+
 plugins += bidirEnv.SharedLibrary('mlt',
         ['mlt/mlt.cpp', 'mlt/mlt_proc.cpp']
 )

@@ -54,9 +54,254 @@ PathSampler::PathSampler(ETechnique technique, const Scene *scene, Sampler *sens
         ++m_sensorDepth;
 }
 
+PathSampler(ETechnique technique, const Scene *scene, const Scene *scene_modified,
+        Sampler *emitterSampler,
+        Sampler *sensorSampler, Sampler *directSampler, int maxDepth, int rrDepth,
+        bool excludeDirectIllum, bool sampleDirect, bool lightImage = true): m_technique(technique), 
+      m_scene(scene), m_scene_modified(scene_modified), m_emitterSampler(emitterSampler),
+      m_sensorSampler(sensorSampler), m_directSampler(directSampler), m_maxDepth(maxDepth),
+      m_rrDepth(rrDepth), m_excludeDirectIllum(excludeDirectIllum), m_sampleDirect(sampleDirect),
+      m_lightImage(lightImage) {
+
+    if (technique == EUnidirectional) {
+        /* Instantiate a volumetric path tracer */
+        Properties props("volpath");
+        props.setInteger("maxDepth", maxDepth);
+        props.setInteger("rrDepth", rrDepth);
+        m_integrator = static_cast<SamplingIntegrator *> (PluginManager::getInstance()->
+            createObject(MTS_CLASS(SamplingIntegrator), props));
+    }
+
+    /* Determine the necessary random walk depths based on properties of the endpoints */
+    m_emitterDepth = m_sensorDepth = maxDepth;
+
+    /* Go one extra step if the sensor can be intersected */
+    if (!m_scene->hasDegenerateSensor() && m_emitterDepth != -1)
+        ++m_emitterDepth;
+
+    /* Go one extra step if there are emitters that can be intersected */
+    if (!m_scene->hasDegenerateEmitters() && m_sensorDepth != -1)
+        ++m_sensorDepth;
+}
+
 PathSampler::~PathSampler() {
     if (!m_pool.unused())
         Log(EWarn, "Warning: memory pool still contains used objects!");
+}
+
+void PathSampler::sampleSplats_mmlt(const Scene *_m_scene, const Point2i &offset, SplatList &list, int depth) {
+    BDAssert(m_technique == EBidirectional);
+    // Log(EInfo,"[sampleSplats_mmlt]..........");
+    const Sensor *sensor = _m_scene->getSensor();
+    list.clear();
+    /*Uniformly sample a scene time */
+    Float time = sensor->getShutterOpen();
+    if (sensor->needsTimeSample())
+        time = sensor->sampleTime(m_sensorSampler->next1D());
+    // Initialize the path endpints
+    m_emitterSubpath.initialize(_m_scene, time, EImportance, m_pool);
+    m_sensorSubpath.initialize(_m_scene, time, ERadiance, m_pool);
+
+    int s, t, nStrategies;
+    if (depth == 0) {
+        nStrategies = 1;
+        m_emitterDepth = 0;
+        m_sensorDepth = 2;
+    } else {
+        nStrategies = depth + 2;
+        m_emitterDepth = std::min((int)(m_sensorSampler->next1D() * nStrategies), nStrategies - 1);
+        m_sensorDepth = nStrategies - m_emitterDepth;
+    }
+    /* Perform two random walks from the sensor and emitter side */
+    m_emitterSubpath.randomWalk(_m_scene, m_emitterSampler, m_emitterDepth,
+            m_rrDepth, EImportance, m_pool);
+
+    if (offset == Point2i(-1))
+        m_sensorSubpath.randomWalk(_m_scene, m_sensorSampler,
+            m_sensorDepth, m_rrDepth, ERadiance, m_pool);
+    else
+        m_sensorSubpath.randomWalkFromPixel(_m_scene, m_sensorSampler,
+            m_sensorDepth, offset, m_rrDepth, m_pool);
+
+    //Compute the combined weights along the two subpaths
+    /* Compute the combined weights along the two subpaths */
+    Spectrum *importanceWeights = (Spectrum *) alloca(m_emitterSubpath.vertexCount() * sizeof(Spectrum)),
+             *radianceWeights  = (Spectrum *) alloca(m_sensorSubpath.vertexCount()  * sizeof(Spectrum));
+
+    importanceWeights[0] = radianceWeights[0] = Spectrum(1.0f);
+    for (size_t i=1; i<m_emitterSubpath.vertexCount(); ++i)
+        importanceWeights[i] = importanceWeights[i-1] *
+            m_emitterSubpath.vertex(i-1)->weight[EImportance] *
+            m_emitterSubpath.vertex(i-1)->rrWeight *
+            m_emitterSubpath.edge(i-1)->weight[EImportance];
+
+    for (size_t i=1; i<m_sensorSubpath.vertexCount(); ++i)
+        radianceWeights[i] = radianceWeights[i-1] *
+            m_sensorSubpath.vertex(i-1)->weight[ERadiance] *
+            m_sensorSubpath.vertex(i-1)->rrWeight *
+            m_sensorSubpath.edge(i-1)->weight[ERadiance];
+
+    if (m_sensorSubpath.vertexCount() > 2) {
+        Point2 samplePos(0.0f);
+        m_sensorSubpath.vertex(1)->getSamplePosition(m_sensorSubpath.vertex(2), samplePos);
+        list.append(samplePos, Spectrum(0.0f));
+    }
+
+    PathVertex tempEndpoint, tempSample;
+    PathEdge tempEdge, connectionEdge;
+    Point2 samplePos(0.0f);
+
+    s = (int) m_emitterSubpath.vertexCount() - 1;
+    t = (int) m_sensorSubpath.vertexCount() - 1;
+    for (int ii=0;ii<1;ii++){
+        PathVertex
+            *vsPred = m_emitterSubpath.vertexOrNull(s-1),
+            *vtPred = m_sensorSubpath.vertexOrNull(t-1),
+            *vs = m_emitterSubpath.vertex(s),
+            *vt = m_sensorSubpath.vertex(t);
+        PathEdge
+            *vsEdge = m_emitterSubpath.edgeOrNull(s-1),
+            *vtEdge = m_sensorSubpath.edgeOrNull(t-1);
+
+        RestoreMeasureHelper rmh0(vs), rmh1(vt);
+
+        /* Will be set to true if direct sampling was used */
+        bool sampleDirect = false;
+
+        /* Number of edges of the combined subpaths */
+        int depth = s + t - 1;
+
+        /* Allowed remaining number of ENull vertices that can
+           be bridged via pathConnect (negative=arbitrarily many) */
+        int remaining = m_maxDepth - depth;
+
+        /* Will receive the path weight of the (s, t)-connection */
+        Spectrum value;
+
+        /* Account for the terms of the measurement contribution
+           function that are coupled to the connection endpoints */
+        if (vs->isEmitterSupernode()) {
+            /* If possible, convert 'vt' into an emitter sample */
+            if (!vt->cast(_m_scene, PathVertex::EEmitterSample) || vt->isDegenerate())
+                break;
+
+            value = radianceWeights[t] *
+                vs->eval(_m_scene, vsPred, vt, EImportance) *
+                vt->eval(_m_scene, vtPred, vs, ERadiance);
+        } else if (vt->isSensorSupernode()) {
+            /* If possible, convert 'vs' into an sensor sample */
+            if (!vs->cast(_m_scene, PathVertex::ESensorSample) || vs->isDegenerate())
+                break;
+
+            /* Make note of the changed pixel sample position */
+            if (!vs->getSamplePosition(vsPred, samplePos))
+                break;
+
+            value = importanceWeights[s] *
+                vs->eval(_m_scene, vsPred, vt, EImportance) *
+                vt->eval(_m_scene, vtPred, vs, ERadiance);
+        } else if (m_sampleDirect && ((t == 1 && s > 1) || (s == 1 && t > 1))) {
+            /* s==1/t==1 path: use a direct sampling strategy if requested */
+            if (s == 1) {
+                if (vt->isDegenerate())
+                    break;
+
+                /* Generate a position on an emitter using direct sampling */
+                value = radianceWeights[t] * vt->sampleDirect(_m_scene, m_directSampler,
+                    &tempEndpoint, &tempEdge, &tempSample, EImportance);
+
+                if (value.isZero())
+                    break;
+                vs = &tempSample; vsPred = &tempEndpoint; vsEdge = &tempEdge;
+                value *= vt->eval(_m_scene, vtPred, vs, ERadiance);
+                vt->measure = EArea;
+            } else {
+                if (vs->isDegenerate())
+                    break;
+                /* Generate a position on the sensor using direct sampling */
+                value = importanceWeights[s] * vs->sampleDirect(_m_scene, m_directSampler,
+                    &tempEndpoint, &tempEdge, &tempSample, ERadiance);
+                if (value.isZero())
+                    break;
+                vt = &tempSample; vtPred = &tempEndpoint; vtEdge = &tempEdge;
+                value *= vs->eval(_m_scene, vsPred, vt, EImportance);
+                vs->measure = EArea;
+            }
+
+            sampleDirect = true;
+        } else {
+            /* Can't connect degenerate endpoints */
+            if (vs->isDegenerate() || vt->isDegenerate())
+                break;
+
+            value = importanceWeights[s] * radianceWeights[t] *
+                vs->eval(_m_scene, vsPred, vt, EImportance) *
+                vt->eval(_m_scene, vtPred, vs, ERadiance);
+
+            /* Temporarily force vertex measure to EArea. Needed to
+               handle BSDFs with diffuse + specular components */
+            vs->measure = vt->measure = EArea;
+        }
+
+        /* Attempt to connect the two endpoints, which could result in
+           the creation of additional vertices (index-matched boundaries etc.) */
+        int interactions = remaining;
+        if (value.isZero() || !connectionEdge.pathConnectAndCollapse(
+                _m_scene, vsEdge, vs, vt, vtEdge, interactions))
+            break;
+
+        depth += interactions;
+
+        if (m_excludeDirectIllum && depth <= 2)
+            break;
+
+        /* Account for the terms of the measurement contribution
+           function that are coupled to the connection edge */
+        if (!sampleDirect)
+            value *= connectionEdge.evalCached(vs, vt, PathEdge::EGeneralizedGeometricTerm);
+        else
+            value *= connectionEdge.evalCached(vs, vt, PathEdge::ETransmittance |
+                    (s == 1 ? PathEdge::ECosineRad : PathEdge::ECosineImp));
+
+        if (sampleDirect) {
+            /* A direct sampling strategy was used, which generated
+               two new vertices at one of the path ends. Temporarily
+               modify the path to reflect this change */
+            if (t == 1)
+                m_sensorSubpath.swapEndpoints(vtPred, vtEdge, vt);
+            else
+                m_emitterSubpath.swapEndpoints(vsPred, vsEdge, vs);
+        }
+
+        /* Compute the multiple importance sampling weight */
+        value *= Path::miWeight(_m_scene, m_emitterSubpath, &connectionEdge,
+            m_sensorSubpath, s, t, m_sampleDirect, m_lightImage);
+
+        if (sampleDirect) {
+            /* Now undo the previous change */
+            if (t == 1)
+                m_sensorSubpath.swapEndpoints(vtPred, vtEdge, vt);
+            else
+                m_emitterSubpath.swapEndpoints(vsPred, vsEdge, vs);
+        }
+
+        /* Determine the pixel sample position when necessary */
+        if (vt->isSensorSample() && !vt->getSamplePosition(vs, samplePos))
+            break;
+
+
+        if (t < 2) {
+            list.append(samplePos, value);
+        } else {
+            BDAssert(m_sensorSubpath.vertexCount() > 2);
+            list.accum(0, value);
+        }
+
+    }
+    /* Release any used edges and vertices back to the memory pool */
+    m_sensorSubpath.release(m_pool);
+    m_emitterSubpath.release(m_pool);
+
 }
 
 void PathSampler::sampleSplats(const Point2i &offset, SplatList &list) {
@@ -310,6 +555,9 @@ void PathSampler::sampleSplats(const Point2i &offset, SplatList &list) {
             Log(EError, "PathSampler::sample(): invalid technique!");
     }
 }
+
+
+
 
 void PathSampler::samplePaths(const Point2i &offset, PathCallback &callback) {
     BDAssert(m_technique == EBidirectional);
@@ -595,6 +843,193 @@ static void seedCallback(std::vector<PathSeed> &output, const Bitmap *importance
     }
 
     output.push_back(PathSeed(0, weight, s, t));
+}
+
+Float PathSampler::generateSeeds_mmlt_difference(size_t nSampleCount, size_t seedCount,
+            bool fineGrained, const Bitmap *importanceMap,
+            std::vector<PathSeed> &seeds, std::vector<PathSeed> &seeds_modified, int maxDepth, 
+            std::vector<Float> &luminance_for_depths, std::vector<Float> &luminance_for_depths_modified){
+    size_t sampleCount =  nSampleCount * (maxDepth + 1);
+    Log(EInfo, "[MMLT]Integrating luminance values over the image plane ("
+            SIZE_T_FMT " samples)..", sampleCount);
+    BDAssert(m_sensorSampler == m_emitterSampler);
+    BDAssert(m_sensorSampler->getClass()->derivesFrom(MTS_CLASS(ReplayableSampler)));
+    
+    ref<Timer> timer = new Timer();
+    std::vector<PathSeed> tempSeeds, tempSeeds_modified;
+    tempSeeds.reserve(sampleCount);
+    tempSeeds_modified.reserve(sampleCount);
+
+    SplatList splatList, splatList_modified;
+    Float luminance, luminance_modified;
+    PathCallback callback = boost::bind(&seedCallback,
+        boost::ref(tempSeeds), importanceMap, boost::ref(luminance),
+        _1, _2, _3, _4);
+    Float mean = 0.0f, variance = 0.0f;
+    // luminance_for_depths.reserve(maxDepth + 1);
+    for (size_t i=0; i<nSampleCount; ++i) {
+        for (int depth=0; depth <= maxDepth; depth++){
+            size_t rngIndex = i * (maxDepth + 1) + depth;
+            // size_t seedIndex = tempSeeds.size();
+            size_t sampleIndex = m_sensorSampler->getSampleIndex();
+            luminance = 0.0;
+            
+            //the original scene
+            /* Run the path sampling strategy */
+            sampleSplats_mmlt(m_scene, Point2i(-1), splatList, depth);
+            luminance = splatList.luminance;
+            splatList.normalize(importanceMap);
+            sampleSplats_mmlt(m_scene_modified, Point2i(-1), splatList_modified, depth);
+            luminance_modified = splatList_modified.luminance;
+            splatList_modified.normalize(importanceMap);
+
+
+            /* Coarse seed granularity (e.g. for PSSMLT) */
+            if (luminance != 0)
+                tempSeeds.push_back(PathSeed(sampleIndex, - luminance, depth));
+            if ((luminance_modified - luminance)!=0)
+                tempSeeds_modified.push_back(PathSeed(sampleIndex, luminance_modified - luminance, depth));
+            
+            /* Numerically robust online variance estimation using an
+           algorithm proposed by Donald Knuth (TAOCP vol.2, 3rd ed., p.232) */
+            Float delta = luminance - mean;
+            // mean += delta / (Float) (i+1);
+            mean += delta / (Float) (rngIndex + 1);
+            variance += delta * (luminance - mean);
+            luminance_for_depths[depth] += (luminance_modified - luminance);
+            luminance_for_depths_modified[depth] += luminance
+        }
+    }
+
+    for (int depth=0; depth<=maxDepth; depth++){
+        luminance_for_depths[depth] /= nSampleCount;
+        luminance_for_depths_modified[depth] /= nSampleCount;
+    }
+
+    BDAssert(m_pool.unused());
+    Float stddev = std::sqrt(variance / (sampleCount-1));
+
+    Log(EInfo, "Done -- average luminance_difference value = %f, stddev = %f (took %i ms)",
+            mean, stddev, timer->getMilliseconds());
+
+    if (mean == 0)
+        Log(EError, "The average image luminance appears to be zero! This could indicate "
+            "a problem with the scene setup. Aborting the MLT rendering process.");
+
+    Log(EDebug, "Sampling " SIZE_T_FMT "/" SIZE_T_FMT " MLT seeds",
+        seedCount, tempSeeds.size());
+
+    //for the original seeds
+    DiscreteDistribution seedPDF(tempSeeds.size());
+    for (size_t i=0; i<tempSeeds.size(); ++i)
+        seedPDF.append(tempSeeds[i].luminance);
+    seedPDF.normalize();
+
+    seeds.clear();
+    seeds.reserve(seedCount);
+    Log(EInfo, "Only %i seedCount ..............");
+    for (size_t i=0; i<seedCount; ++i)
+        seeds.push_back(tempSeeds.at(seedPDF.sample(m_sensorSampler->next1D())));
+
+    /* Sort the seeds to avoid unnecessary rewinds in the ReplayableSampler */
+    std::sort(seeds.begin(), seeds.end(), PathSeedSortPredicate());
+
+    // for the modified part
+    DiscreteDistribution seedPDF_modified(tempSeeds_modified.size());
+    for (size_t i=0; i<tempSeeds_modified.size(); ++i)
+        seedPDF_modified.append(tempSeeds_modified[i].luminance);
+    seedPDF_modified.normalize();
+
+    seeds_modified.clear();
+    seeds_modified.reserve(seedCount);
+    Log(EInfo, "Only %i seedCount ..............");
+    for (size_t i=0; i<seedCount; ++i)
+        seeds_modified.push_back(tempSeeds_modified.at(seedPDF_modified.sample(m_sensorSampler->next1D())));
+
+    /* Sort the seeds to avoid unnecessary rewinds in the ReplayableSampler */
+    std::sort(seeds_modified.begin(), seeds_modified.end(), PathSeedSortPredicate());
+
+    return mean; //this is only for dictation; the difference part.
+}
+
+Float PathSampler::generateSeeds_mmlt(size_t nSampleCount, size_t seedCount,
+            bool fineGrained, const Bitmap *importanceMap,
+            std::vector<PathSeed> &seeds, int maxDepth, std::vector<Float> &luminance_for_depths){
+    size_t sampleCount =  nSampleCount * (maxDepth + 1);
+    Log(EInfo, "[MMLT]Integrating luminance values over the image plane ("
+            SIZE_T_FMT " samples)..", sampleCount);
+    BDAssert(m_sensorSampler == m_emitterSampler);
+    BDAssert(m_sensorSampler->getClass()->derivesFrom(MTS_CLASS(ReplayableSampler)));
+    
+    ref<Timer> timer = new Timer();
+    std::vector<PathSeed> tempSeeds;
+    tempSeeds.reserve(sampleCount);
+
+    SplatList splatList;
+    Float luminance;
+    PathCallback callback = boost::bind(&seedCallback,
+        boost::ref(tempSeeds), importanceMap, boost::ref(luminance),
+        _1, _2, _3, _4);
+    Float mean = 0.0f, variance = 0.0f;
+    // luminance_for_depths.reserve(maxDepth + 1);
+    for (size_t i=0; i<nSampleCount; ++i) {
+        for (int depth=0; depth <= maxDepth; depth++){
+            size_t rngIndex = i * (maxDepth + 1) + depth;
+            // size_t seedIndex = tempSeeds.size();
+            size_t sampleIndex = m_sensorSampler->getSampleIndex();
+            luminance = 0.0;
+            
+            /* Run the path sampling strategy */
+            sampleSplats_mmlt(m_scene, Point2i(-1), splatList, depth);
+            luminance = splatList.luminance;
+            splatList.normalize(importanceMap);
+
+            /* Coarse seed granularity (e.g. for PSSMLT) */
+            if (luminance != 0)
+                tempSeeds.push_back(PathSeed(sampleIndex, luminance, depth));
+            
+            /* Numerically robust online variance estimation using an
+           algorithm proposed by Donald Knuth (TAOCP vol.2, 3rd ed., p.232) */
+            Float delta = luminance - mean;
+            // mean += delta / (Float) (i+1);
+            mean += delta / (Float) (rngIndex + 1);
+            variance += delta * (luminance - mean);
+            luminance_for_depths[depth] += luminance;
+        }
+    }
+    for (int depth=0; depth<=maxDepth; depth++){
+        luminance_for_depths[depth] /= nSampleCount;
+    }
+
+    BDAssert(m_pool.unused());
+    Float stddev = std::sqrt(variance / (sampleCount-1));
+
+    Log(EInfo, "Done -- average luminance value = %f, stddev = %f (took %i ms)",
+            mean, stddev, timer->getMilliseconds());
+
+    if (mean == 0)
+        Log(EError, "The average image luminance appears to be zero! This could indicate "
+            "a problem with the scene setup. Aborting the MLT rendering process.");
+
+    Log(EDebug, "Sampling " SIZE_T_FMT "/" SIZE_T_FMT " MLT seeds",
+        seedCount, tempSeeds.size());
+
+    DiscreteDistribution seedPDF(tempSeeds.size());
+    for (size_t i=0; i<tempSeeds.size(); ++i)
+        seedPDF.append(tempSeeds[i].luminance);
+    seedPDF.normalize();
+
+    seeds.clear();
+    seeds.reserve(seedCount);
+    Log(EInfo, "Only %i seedCount ..............");
+    for (size_t i=0; i<seedCount; ++i)
+        seeds.push_back(tempSeeds.at(seedPDF.sample(m_sensorSampler->next1D())));
+
+    /* Sort the seeds to avoid unnecessary rewinds in the ReplayableSampler */
+    std::sort(seeds.begin(), seeds.end(), PathSeedSortPredicate());
+
+    return mean;
+
 }
 
 Float PathSampler::generateSeeds(size_t sampleCount, size_t seedCount,

@@ -73,6 +73,68 @@ RenderJob::RenderJob(const std::string &threadName,
     }
     m_cancelled = false;
 }
+//ADDED
+RenderJob::RenderJob(const std::string &threadName,
+    Scene *scene, Scene *scene_modified, RenderQueue *queue, int sceneResID, int sceneModifiedResID,
+    int sensorResID,
+    int samplerResID, bool threadIsCritical, bool interactive)
+    : Thread(threadName), m_scene(scene), m_scene_modified(scene_modified),
+    m_queue(queue), m_interactive(interactive) {
+
+    /* Optional: bring the process down when this thread crashes */
+    setCritical(threadIsCritical);
+
+    m_queue->addJob(this);
+    ref<Scheduler> sched = Scheduler::getInstance();
+
+    ref<Sensor> sensor = m_scene->getSensor();
+    ref<Sampler> sampler = m_scene->getSampler();
+
+    /* Register the scene with the scheduler if needed */
+    if (sceneResID == -1) {
+        m_sceneResID = sched->registerResource(m_scene);
+        m_ownsSceneResource = true;
+    } else {
+        m_sceneResID = sceneResID;
+        m_ownsSceneResource = false;
+    }
+    /* Register the scene with the scheduler if needed */
+    if (sceneModifiedResID == -1) {
+        sceneModifiedResID = sched->registerResource(m_scene_modified);
+        // m_ownsSceneResource = true;
+    } else {
+        m_sceneModifiedResID = sceneModifiedResID;
+        // m_ownsSceneResource = false;
+    }
+
+    /* Register the sensor with the scheduler if needed */
+    if (sensorResID == -1) {
+        m_sensorResID = sched->registerResource(sensor);
+        m_ownsSensorResource = true;
+    } else {
+        m_sensorResID = sensorResID;
+        m_ownsSensorResource = false;
+    }
+
+    /* Register the sampler with the scheduler if needed */
+    if (samplerResID == -1) {
+        /* Create a sampler instance for every core */
+        std::vector<SerializableObject *> samplers(sched->getCoreCount());
+        for (size_t i=0; i<sched->getCoreCount(); ++i) {
+            ref<Sampler> clonedSampler = sampler->clone();
+            clonedSampler->incRef();
+            samplers[i] = clonedSampler.get();
+        }
+        m_samplerResID = sched->registerMultiResource(samplers);
+        for (size_t i=0; i<sched->getCoreCount(); ++i)
+            samplers[i]->decRef();
+        m_ownsSamplerResource = true;
+    } else {
+        m_samplerResID = samplerResID;
+        m_ownsSamplerResource = false;
+    }
+    m_cancelled = false;
+}
 
 RenderJob::~RenderJob() {
     Scheduler *sched = Scheduler::getInstance();
